@@ -1,0 +1,77 @@
+# This workflow keeps the fork's `main` and release tags in step with upstream
+# and opens an issue for each new upstream release. It never changes
+# `nodescout/main`.
+# See FORK_MAINTENANCE.md for the branch model, the sync token, and the upgrade process.
+name: nodescout upstream sync
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: nodescout-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # The sync token is an environment secret limited to nodescout/main, so the
+    # upstream workflows that run on `main` in this fork cannot read it.
+    environment: upstream-sync
+    env:
+      UPSTREAM_REPO: verygoodplugins/whatsapp-mcp
+      UPSTREAM_URL: https://github.com/verygoodplugins/whatsapp-mcp.git
+    steps:
+      - name: Check out the mirror branch with the sync token
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Fetch upstream and list new tags
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL"
+          git ls-remote --tags --refs origin | sed 's|.*refs/tags/||' | sort > "$RUNNER_TEMP/fork-tags"
+          # This fetch fails if upstream moved a tag this fork already has.
+          git fetch upstream main --tags
+          git ls-remote --tags --refs upstream | sed 's|.*refs/tags/||' | sort > "$RUNNER_TEMP/upstream-tags"
+          comm -13 "$RUNNER_TEMP/fork-tags" "$RUNNER_TEMP/upstream-tags" > "$RUNNER_TEMP/new-tags"
+          grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' "$RUNNER_TEMP/new-tags" > "$RUNNER_TEMP/new-releases" || true
+          echo "New upstream tags:"
+          cat "$RUNNER_TEMP/new-tags"
+
+      # Issues are opened before the push, so a failed push leaves the tags
+      # "new" and the next run retries them without opening duplicate issues.
+      - name: Open an issue for each new upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          while read -r tag; do
+            title="Upstream release $tag is available"
+            existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state all \
+              --search "in:title \"$title\"" --json number --jq 'length')
+            if [ "$existing" = "0" ]; then
+              body=$(printf '%s\n\n%s\n' \
+                "Upstream published [$tag](https://github.com/$UPSTREAM_REPO/releases/tag/$tag). The runtime pin on \`nodescout/main\` has not changed." \
+                "Follow the [upgrade process](https://github.com/$GITHUB_REPOSITORY/blob/nodescout/main/FORK_MAINTENANCE.md#upgrade-process) to review, merge, tag, and rebuild.")
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+            fi
+          done < "$RUNNER_TEMP/new-releases"
+
+      - name: Fast-forward main and mirror new tags
+        run: |
+          set -euo pipefail
+          # A plain push is refused unless it is a fast-forward, so a rewritten
+          # upstream history fails the run and leaves the mirror unchanged.
+          git push origin refs/remotes/upstream/main:refs/heads/main
+          if [ -s "$RUNNER_TEMP/new-tags" ]; then
+            sed 's|^|refs/tags/|' "$RUNNER_TEMP/new-tags" | xargs git push origin
+          fi
